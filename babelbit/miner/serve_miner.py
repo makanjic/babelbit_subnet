@@ -31,6 +31,92 @@ _PROMPT_CACHE: dict[str, torch.Tensor] = {}
 _MINER_HOTKEY_SS58: Optional[str] = None
 
 
+# -----------------------------------------------------------------------------
+# Post-processing helpers (kept intentionally lightweight)
+# -----------------------------------------------------------------------------
+# These helpers enforce the same constraints your training/harness uses:
+#   - Truncate at the utterance-level EOF marker (if configured)
+#   - Ensure a single-sentence prediction (token-based heuristic)
+#   - Join prefix + completion without introducing spurious punctuation/spacing
+#
+# Rationale:
+# Validators score against *utterance-level* ground truth. Even when the model
+# learns to stop, decoding can still include extra tail tokens. These rules
+# provide a deterministic guardrail consistent with your finetune harness.
+_ABBREVIATIONS = {
+    "mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.",
+    "inc.", "ltd.", "corp.", "co.",
+    "e.g.", "i.e.", "etc.", "vs.",
+    "u.s.", "u.k.", "no.", "st.", "mt.",
+}
+
+
+def _truncate_at_eof_token(text: str, eof_token: str) -> str:
+    """Truncate `text` at the first occurrence of `eof_token` (literal substring)."""
+    if not eof_token:
+        return text
+    idx = text.find(eof_token)
+    if idx < 0:
+        return text
+    return text[:idx].rstrip()
+
+
+def _is_sentence_end_token(tok: str) -> bool:
+    """
+    Token-based sentence boundary heuristic:
+      - strip trailing quotes/brackets
+      - ignore common abbreviations
+      - treat tokens ending with . ! ? as a sentence terminator
+    """
+    if not tok:
+        return False
+    stripped = tok.rstrip('"\')]}')
+    if not stripped:
+        return False
+    low = stripped.lower()
+    if low in _ABBREVIATIONS:
+        return False
+    return stripped.endswith((".", "!", "?"))
+
+
+def truncate_to_one_sentence_tokenwise(text: str) -> str:
+    """Keep only the first completed sentence in token space (split by whitespace)."""
+    text = (text or "").strip()
+    if not text:
+        return text
+    tokens = text.split()
+    out: list[str] = []
+    for t in tokens:
+        out.append(t)
+        if _is_sentence_end_token(t):
+            break
+    return " ".join(out).strip()
+
+
+def _join_prefix_completion(prefix: str, completion: str) -> str:
+    """
+    Join prefix + completion without adding unwanted spaces/punctuation.
+
+    - If completion begins with whitespace, concatenate directly.
+    - If completion begins with punctuation, concatenate directly.
+    - Otherwise add exactly one space between prefix and completion.
+    """
+    prefix = (prefix or "").strip()
+    completion = completion or ""
+    if not prefix:
+        return completion.strip()
+    if not completion:
+        return prefix
+
+    if completion[:1].isspace():
+        return (prefix + completion).strip()
+
+    if completion[0] in {".", ",", ":", ";", "!", "?", ")", "]", "}", "'"}:
+        return (prefix + completion).strip()
+
+    return (prefix + " " + completion).strip()
+
+
 def _get_miner_hotkey_ss58() -> Optional[str]:
     """Load and cache this miner's hotkey SS58 address."""
     global _MINER_HOTKEY_SS58
@@ -142,15 +228,34 @@ class BabelbitMiner:
                 if inputs.numel() == 0:
                     raise ValueError("Empty tokenization result")
                 return inputs.to(self.device)
-            
-            # Heuristic: find last occurrence of static instruction
-            marker = "Continue the utterance"
-            idx = prompt.rfind(marker)
-            if idx != -1:
-                static_part = prompt[:idx]
+
+            # -----------------------------------------------------------------
+            # Prompt tokenization caching (context + separator + prefix)
+            # -----------------------------------------------------------------
+            # The miner prompt is train-faithful:
+            #   - prompt = prefix
+            #   - prompt = context + SEP + prefix
+            #
+            # Validators commonly query multiple steps for the same utterance:
+            # the context remains constant while the prefix grows. To reduce
+            # repeated tokenization cost, cache tokenization of:
+            #   static_part = context + SEP
+            # and only encode the dynamic prefix tail.
+            #
+            # IMPORTANT:
+            # Some tokenizers can tokenize boundaries differently if you split at
+            # a non-whitespace boundary. We therefore only enable the split-cache
+            # when SEP ends with whitespace, and we split on the *last* occurrence
+            # of SEP inside the prompt.
+            sep = os.getenv("MINER_CONTEXT_SEPARATOR", " EOF ")
+            idx = prompt.rfind(sep) if sep else -1
+            if idx != -1 and sep and len(sep) > 0 and sep[-1].isspace():
+                split_at = idx + len(sep)  # include SEP inside cached portion
+                static_part = prompt[:split_at]
+                dynamic_part = prompt[split_at:]
+
                 cache_key = static_part
-                dynamic_part = prompt[idx:]
-                
+
                 if cache_key in _PROMPT_CACHE:
                     static_ids = _PROMPT_CACHE[cache_key]
                 else:
@@ -162,13 +267,10 @@ class BabelbitMiner:
                 dyn_ids = self._tokenizer.encode(dynamic_part, return_tensors="pt")
                 if dyn_ids.numel() == 0:
                     raise ValueError("Empty dynamic tokenization result")
-                
-                # Concatenate tokens
-                if dyn_ids.size(1) > 1:
-                    full = torch.cat([static_ids, dyn_ids[:, 1:]], dim=1)
-                else:
-                    full = static_ids
-                
+
+                # Concatenate cached static context+SEP ids with dynamic prefix ids.
+                full = torch.cat([static_ids, dyn_ids], dim=1)
+
                 if full.numel() == 0:
                     raise ValueError("Empty concatenated tensor")
                 return full.to(self.device)
@@ -225,36 +327,34 @@ class BabelbitMiner:
             
             logger.info(f"Generating prediction for prefix: '{request.prefix}'")
             logger.info(f"Using context: '{request.context}'")
-            
-            # Create prompt similar to the chute template
-            system_msg = (
-                "You are a helpful assistant that completes the current utterance naturally and succinctly. "
-                "Return only the completed utterance text without quotes or extra commentary."
-            )
-            
-            # Build the prompt with context and prefix
+
+            # ---------------------------------------------------------------------
+            # PROMPT FORMAT (MUST MATCH TRAINING/HARNESS)
+            # ---------------------------------------------------------------------
+            # Training/harness builds prompts as:
+            #   - prompt = prefix                                (if no context)
+            #   - prompt = context + context_separator + prefix   (if context)
+            #
+            # Therefore, we must NOT wrap the request into a chat template or
+            # instruction-style prompt here; doing so creates inference-time
+            # distribution shift relative to training and tends to reduce SN59
+            # validator score.
+            #
+            # The separator must match your training wrapper (default: " EOF ").
+            # Keep it configurable via env var for operational flexibility.
+            sep = os.getenv("MINER_CONTEXT_SEPARATOR", " EOF ")
+
             if request.context:
-                user_msg = f"Context:\n{request.context}\n\nContinue the utterance that begins with:\n{request.prefix}"
+                # If prefix is empty, mirror training behavior: ctx + sep
+                prompt = f"{request.context}{sep}{request.prefix}" if request.prefix else f"{request.context}{sep}"
             else:
-                user_msg = f"Continue the utterance that begins with:\n{request.prefix}"
-            
-            # Use chat template if available
-            try:
-                if hasattr(self._tokenizer, 'apply_chat_template'):
-                    messages = [
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": user_msg},
-                    ]
-                    prompt = self._tokenizer.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True
-                    )
-                else:
-                    # Fallback for models without chat template
-                    prompt = f"System: {system_msg}\n\nUser: {user_msg}\n\nAssistant:"
-            except Exception:
-                # Simple fallback if chat template fails
                 prompt = f"{request.prefix}"
-            
+
+            # Transformers edge case: empty prompt can yield empty input_ids and
+            # break generation. Match harness behavior by forcing a safe token.
+            if len(prompt.strip()) == 0:
+                prompt = self._tokenizer.eos_token or ""
+
             # Move model to device lazily (only first call)
             if not self._model_moved:
                 try:
@@ -311,60 +411,83 @@ class BabelbitMiner:
             
             # Check for early exit if prefix already ends with EOS
             if self._tokenizer.eos_token and request.prefix.strip().endswith(self._tokenizer.eos_token):
-                return PredictResponse(prediction="")
+                logger.warning("Prefix already contains EOS token, returning as-is")
+                return PredictResponse(prediction=request.prefix.strip())
             
-            # Generate prediction
-            try:
-                def generate():
-                    with torch.no_grad():
-                        if self.device.type == "cuda":
-                            with torch.autocast(device_type="cuda", enabled=True):
-                                return self._model.generate(inputs, **gen_kwargs)
-                        else:
-                            return self._model.generate(inputs, **gen_kwargs)
-                
-                outputs = await asyncio.to_thread(generate)
-                
-            except RuntimeError as e:
-                if "CUDA" in str(e):
-                    logger.error(f"CUDA error during generation: {str(e)}")
-                    # Try on CPU as fallback
-                    inputs_cpu = inputs.cpu()
-                    self._model.cpu()
-                    self.device = torch.device("cpu")
+            # Run generation with safety checks
+            with torch.no_grad():
+                try:
+                    # Ensure input length is within model limits
+                    max_pos = getattr(self._model.config, "max_position_embeddings", None)
+                    if max_pos and inputs.size(1) > max_pos - 1:
+                        # Truncate from the left if too long
+                        inputs = inputs[:, -(max_pos - 1):]
+                        logger.warning(f"Truncated input to {inputs.size(1)} tokens to fit model limit {max_pos}")
                     
-                    with torch.no_grad():
-                        outputs = self._model.generate(inputs_cpu, **gen_kwargs)
-                else:
-                    raise e
-            
-            # Decode the generated text
-            generated_text = self._tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            # Extract only the new part (remove the input prompt)
-            if generated_text.startswith(prompt):
-                prediction = generated_text[len(prompt):].strip()
+                    def _generate_on_device():
+                        return self._model.generate(inputs, **gen_kwargs)
+                    
+                    outputs = await asyncio.to_thread(_generate_on_device)
+
+                except RuntimeError as e:
+                    if "CUDA" in str(e):
+                        logger.error("CUDA error during generation: %s", e)
+                        logger.info("Retrying generation on CPU.")
+                        # Move to CPU and retry once
+                        inputs_cpu = inputs.cpu()
+                        self._model.cpu()
+                        self.device = torch.device("cpu")
+                        with torch.no_grad():
+                            outputs = self._model.generate(inputs_cpu, **gen_kwargs)
+                    else:
+                        raise
+
+            # Decode only the NEW tokens after the prompt (more reliable than string slicing).
+            # This avoids edge cases where generated_text does not start with the exact prompt
+            # due to tokenizer normalization.
+            prompt_len = inputs.size(1)
+
+            # `outputs` is typically shape [1, seq_len]. Normalize to 1D token ids.
+            out_ids = outputs[0] if outputs.ndim == 2 else outputs
+            if out_ids.ndim != 1:
+                raise ValueError(f"Unexpected output tensor shape: {out_ids.shape}")
+
+            if prompt_len > out_ids.shape[0]:
+                # Fallback: decode everything (should be rare).
+                completion = self._tokenizer.decode(out_ids, skip_special_tokens=True)
             else:
-                prediction = generated_text.strip()
-            
-            # Clean up the prediction
-            prediction = prediction.replace("System:", "").replace("User:", "").replace("Assistant:", "").strip()
-            
-            # If prediction contains the original prefix, extract just the completion
-            if request.prefix in prediction and prediction != request.prefix:
-                prefix_pos = prediction.find(request.prefix)
-                if prefix_pos != -1:
-                    after_prefix = prediction[prefix_pos + len(request.prefix):].strip()
-                    if after_prefix:
-                        prediction = after_prefix
-            
-            # Ensure we have some prediction
-            if not prediction or prediction.strip() == "" or prediction.strip() == request.prefix.strip():
-                prediction = os.getenv("CHUTE_FALLBACK_COMPLETION", "...")
-            
-            # Return full utterance (prefix + prediction)
-            full_prediction = request.prefix + ' ' + prediction
-            
+                completion = self._tokenizer.decode(out_ids[prompt_len:], skip_special_tokens=True)
+
+            completion = completion.lstrip("\\n\\r")
+
+            # With a train-faithful raw prompt, the decoded new tokens are already the completion.
+            prediction_tail = completion.strip()
+
+            # ---------------------------------------------------------------------
+            # Post-process and assemble final utterance prediction (prefix + completion)
+            # ---------------------------------------------------------------------
+            # 1) Join safely (no spurious spaces before punctuation).
+            full_prediction = _join_prefix_completion(request.prefix, prediction_tail)
+
+            # 2) Truncate at utterance EOF token.
+            #    Your training wrapper appends the literal token (including spaces):
+            #      --utterance_eof_token " <EOFUTR> "
+            #    Do NOT .strip() this environment variable; stripping would change the
+            #    literal marker and truncation would fail.
+            utterance_eof_token = os.getenv("MINER_UTTERANCE_EOF_TOKEN", " <EOFUTR> ")
+            if utterance_eof_token:
+                full_prediction = _truncate_at_eof_token(full_prediction, utterance_eof_token)
+
+            # 3) Enforce single-sentence output (default ON).
+            truncate_one_sentence_env = os.getenv("MINER_TRUNCATE_ONE_SENTENCE", "1")
+            truncate_one_sentence = truncate_one_sentence_env not in ("0", "false", "False")
+            if truncate_one_sentence:
+                full_prediction = truncate_to_one_sentence_tokenwise(full_prediction)
+
+            # If still empty, fall back to the prefix (never invent punctuation-only tails).
+            if not full_prediction or full_prediction.strip() == "":
+                full_prediction = (request.prefix or "").strip()
+
             logger.info(f"Generated: {full_prediction[:100]}...")
             
             return PredictResponse(prediction=full_prediction)
