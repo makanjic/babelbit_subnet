@@ -429,7 +429,7 @@ async def runner(slug: str | None = None, utterance_engine_url: str | None = Non
         logger.info(f"Starting shared utterance session for {len(miner_list)} miners")
         
         # Get step block modulo from environment (default: 1 block)
-        step_block_modulo = int(os.getenv("BB_STEP_BLOCK_MODULO", "2"))
+        step_block_modulo = int(os.getenv("BB_STEP_BLOCK_MODULO", "0"))
         logger.debug(
             "[runner] session params: timeout=%.2fs step_block_modulo=%d", chutes_timeout, step_block_modulo
         )

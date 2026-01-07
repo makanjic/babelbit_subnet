@@ -198,6 +198,22 @@ async def _validate_main(tail: int, alpha: float, m_min: int, tempo: int):
             await asyncio.sleep(5)
 
 
+def compute_weights(winner_uid: int, trailing_uid_dict: dict[int, float]):
+    # Sparse weights (winner gets 95%, remaining 5% distributed proportionally)
+    # Avoids active miners from being deregistered due to zero weights
+    positive_trailing = [
+        (uid, max(float(score or 0.0), 0.0))
+        for uid, score in trailing_uid_dict.items()
+        if max(float(score or 0.0), 0.0) > 0.0
+    ]
+    if not positive_trailing:
+        return [1.0], [winner_uid]
+
+    total_trailing = sum(score for _, score in positive_trailing)
+    trailing_weights = [0.05 * score / total_trailing for _, score in positive_trailing]
+    trailing_uids = [uid for uid, _ in positive_trailing]
+    return [0.95] + trailing_weights, [winner_uid] + trailing_uids
+        
 # ---------------- Weights selection ---------------- #
 
 async def get_weights(
@@ -227,7 +243,9 @@ async def get_weights(
         latest_per_hk: dict[str, float] = {}
         for row in scores:
             hk = row.get("miner_hotkey") or row.get("hotkey")
-            score = row.get("challenge_mean_score") or row.get("score")
+            score = row.get("challenge_mean_score")
+            if score is None:
+                score = row.get("score")
             if hk is None or score is None:
                 continue
             if hk not in hk_to_uid:
@@ -237,12 +255,22 @@ async def get_weights(
                 latest_per_hk[hk] = float(score)
 
         if latest_per_hk:
+            logger.debug(f"get_weights: latest_per_hk count={len(latest_per_hk)}")
             winner_hk = max(latest_per_hk.keys(), key=lambda k: latest_per_hk[k])
             winner_uid = hk_to_uid[winner_hk]
             uids = [winner_uid]
             weights = [1.0]
 
-            # Prometheus metrics
+            logger.debug(f"get_weights: selecting winner among {len(latest_per_hk)} miners")
+            winner_hk = max(latest_per_hk.keys(), key=lambda k: latest_per_hk[k])
+            winner_uid = hk_to_uid.get(winner_hk, 0)
+
+            trailing_uid_dict = {hk_to_uid[hk]: score for hk, score in latest_per_hk.items() if hk != winner_hk}
+            logger.debug(f"get_weights: winner_hk={winner_hk} winner_uid={winner_uid} trailing_uids={trailing_uid_dict}")
+
+            weights, uids = compute_weights(winner_uid, trailing_uid_dict)
+
+            # Prometheus (optional)
             for hk, v in latest_per_hk.items():
                 uid = hk_to_uid.get(hk)
                 if uid is not None:
@@ -299,6 +327,8 @@ async def fetch_scores_from_api(base_url: str, validator_kp, challenge_uid: Opti
     }
 
     session = await get_async_client()
+    req_timeout = getattr(session, "timeout", None)
+    timeout_s = getattr(req_timeout, "total", None)
     try:
         async with session.get(url, params=params) as resp:
             if resp.status != 200:
@@ -312,8 +342,22 @@ async def fetch_scores_from_api(base_url: str, validator_kp, challenge_uid: Opti
                 return []
             body = await resp.json()
             return body.get("scores") or []
+    except asyncio.TimeoutError:
+        logger.warning(
+            "get_scores call timed out after %ss (challenge_uid=%s url=%s)",
+            timeout_s if timeout_s is not None else "unknown",
+            challenge_uid,
+            url,
+        )
+        return []
     except Exception as e:
-        logger.warning("get_scores call failed: %s", e)
+        logger.warning(
+            "get_scores call failed (%s) challenge_uid=%s url=%s: %s",
+            e.__class__.__name__,
+            challenge_uid,
+            url,
+            e,
+        )
         return []
 
 
