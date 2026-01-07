@@ -1,3 +1,4 @@
+import gc
 import os
 import time
 import json
@@ -84,6 +85,8 @@ async def _validate_main(tail: int, alpha: float, m_min: int, tempo: int):
     last_set_weights: Optional[Tuple[List[int], List[float]]] = None
     validator_kp = load_hotkey_keypair(settings.BITTENSOR_WALLET_COLD, settings.BITTENSOR_WALLET_HOT)
     last_challenge_uid: Optional[str] = None
+    set_weight_count = 0
+    reset_interval = int(os.getenv("SIGNER_SUBTENSOR_RESET_INTERVAL", "50"))
     
     while True:
         try:
@@ -175,6 +178,16 @@ async def _validate_main(tail: int, alpha: float, m_min: int, tempo: int):
                 LASTSET_GAUGE.set(time.time())
                 logger.info("set_weights OK at block %d", block)
                 last_set_weights = (uids, weights)
+
+                set_weight_count += 1
+                logger.info("Total set_weights calls so far: %d", set_weight_count)
+
+                if set_weight_count >= reset_interval:
+                    logger.info("Performed %d set_weights calls, resetting subtensor connection to free resources.", set_weight_count)
+                    st = None
+                    await reset_subtensor()
+                    gc.collect()
+                    set_weight_count = 0
             else:
                 logger.warning("set_weights failed at block %d", block)
 
