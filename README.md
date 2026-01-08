@@ -17,18 +17,18 @@ but is articulated something like:
 That is, **the listener has no idea what the sentence is about (breaking a lock) until the very last word**. 
 
 ### Our Hypothesis
-When native speakers listen to sentences with the verb at the end, in the vast majority of cases, they know what it will be. LLMs work in exactly the same way. In fact the fundamental mechanism by which they appear to exhibit intelligence is in predicting the best possible work to come next given the prior context. We are going to stretch this predictive power to its absolute limits, so that we can guess from the context what speaker is about to say, and start translating earlier. 
+When native speakers listen to sentences with the verb at the end, in the vast majority of cases, they know what it will be. LLMs work in exactly the same way. In fact the fundamental mechanism by which they appear to exhibit intelligence is in predicting the best possible word to come next given the prior context. We are going to stretch this predictive power to its absolute limits, so that we can guess from the context what speaker is about to say, and start translating earlier. 
 
 ## Our First Challenge
 - it doesn't involve speech
 - it doesn't involve translation
 - **What????**
 
-Our first job it develop the prediction technique. So the challenge involves predicting not just the next word, but the entire phrase or sentence, and predicting it again, each time a word is revealed.
+Our first job is to develop the prediction technique. So the challenge involves predicting not just the next word, but the entire phrase or sentence, and predicting it again, each time a word is revealed.
 
 What's more, **the best answer might not have all the words right**
 
-Remember that our predictions are part of a translation system. So if your script makes a prediction which *means* the same as the input, it can score very highly. Translating a sentence which means the same as what was said is just as good as tranlating the original, especially if it can be output much more quickly, e.g. 
+Remember that our predictions are part of a translation system. So if your script makes a prediction which *means* the same as the input, it can score very highly. Translating a sentence which means the same as what was said is just as good as translating the original, especially if it can be output much more quickly, e.g. 
 
 INPUT: Hi - how is all going with you?
 
@@ -36,7 +36,7 @@ REVEALED PART OF THE INPUT: Hi - how....
 
 PREDICTION: Hi - how are you?
 
-Would it matter if we translated "how are you?" insteadn of "how is all going with you?"
+Would it matter if we translated "how are you?" instead of "how is all going with you?"
 
 So first we must master the art of making predictions which are similar, whether that is *lexically* or *semantically* similar. If we can get a semantically adequate prediction *much* earlier than we could if we waited for the whole input, we can reduce translation latency by a huge degree. 
 
@@ -76,7 +76,17 @@ btcli wallet new_hotkey --wallet.name my-wallet --n_words 24 --wallet.hotkey my-
 cat >> .env << 'EOF'
 BITTENSOR_WALLET_COLD=coldkey
 BITTENSOR_WALLET_HOT=my-hotkey
-BITTENSOR_WALLET_PATH=path-~/.bittensor/wallets/my-wallet/hotkeys/my-hotkey
+# Path to your hotkey file
+BITTENSOR_WALLET_PATH=~/.bittensor/wallets/my-wallet/hotkeys/my-hotkey
+EOF
+```
+If you are using a different subnet or a local subtensor, also set:
+```bash
+cat >> .env << 'EOF'
+# Subnet and subtensor configuration
+BABELBIT_NETUID=59
+BITTENSOR_SUBTENSOR_ENDPOINT=finney
+BITTENSOR_SUBTENSOR_FALLBACK=wss://lite.sub.latent.to:443
 EOF
 ```
 
@@ -137,12 +147,39 @@ S3_REGION=s3-region
 S3_ACCESS_KEY_ID=your-s3-access-key
 S3_SECRET_ACCESS_KEY=your-s3-secret
 S3_BUCKET_NAME=your-s3-bucket
-S3_CHALLENGES_DIR=challenges
+S3_SUBMISSIONS_DIR=challenges
 S3_LOG_DIR=logs
 S3_ADDRESSING_STYLE=s3-addressing-style-used-by-your-cloud-provider
 S3_SIGNATURE_VERSION=s3-signature-version
 S3_USE_SSL=true-or-false
 EOF
+```
+`S3_SUBMISSIONS_DIR` is the challenges directory prefix (older docs used `S3_CHALLENGES_DIR`).
+
+## Validator/Runner Endpoints
+
+The validator and runner call out to external services. You can override these defaults if needed.
+
+### Update your .env file
+```bash
+cat >> .env << 'EOF'
+BB_UTTERANCE_ENGINE_URL=https://api.babelbit.ai
+BB_SUBMIT_API_URL=https://scoring.babelbit.ai
+EOF
+```
+
+## Local setup (non-docker)
+If you plan to run the validator/runner/signer or the self-hosted miner locally, install the CLI and deps once:
+```bash
+# Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# setup
+uv venv && source .venv/bin/activate
+uv sync  # install deps
+
+# verify installation
+bb
 ```
 
 ## Running the validator
@@ -154,10 +191,20 @@ docker compose up --build -d && docker compose logs -f
 ```
 
 (Optional): Run the validator locally
+Local runs require a reachable signer service. The default `SIGNER_URL` is
+`http://signer:8080` (docker-only), so set it to your local signer first:
 ```bash
-sv -vv validate
-sv -vv runner
-sv -vv signer
+cat >> .env << 'EOF'
+SIGNER_URL=http://127.0.0.1:8080
+# Optional: override signer bind/port if needed
+# SIGNER_HOST=127.0.0.1
+# SIGNER_PORT=8080
+EOF
+```
+```bash
+bb -vv validate
+bb -vv runner
+bb -vv signer
 ```
 
 # Miners
@@ -189,9 +236,9 @@ bb
 ```
 
 1. Register with the Subnet 
-Register your miner to BabelBit (SNXX).
+Register your miner to BabelBit (SN59).
 ```bash
-btcli subnet register --wallet.name <your cold> --wallet.hotkey <your hot>
+btcli subnet register --wallet.name <your cold> --wallet.hotkey <your hot> --netuid 59
 ```
 
 2. Upgrade Chutes to a Developer-Enable Account
@@ -215,8 +262,8 @@ It is highly recommended to build the chute locally after any changes to check f
 - (optional) ssh onto a machine with the specs matching your requirements (e.g. GPU, etc)
 - ensure your `~/.chutes/config.ini` file is present on the machine (generated automatically when you register with chutes)
 - install docker and chutes 
-- generate the python script containing your chute called "my_chutes.py" via `bb -v generate-chute-script --revision your-hf-sha`
-- run `chutes build my_chutes:chute --local --public`
+- generate the python script containing your chute called "my_chute.py" via `bb -v generate-chute-script --revision your-hf-sha`
+- run `chutes build my_chute:chute --local --public`
 - `docker images`
 - run the image you just built and enter it `docker run -p 8000:8000 -it <image-name> /bin/bash` 
 - when inside the container: `export CHUTES_EXECUTION_CONTEXT=REMOTE` and run `chutes run my_chute:chute --dev --debug`
@@ -226,10 +273,10 @@ It is highly recommended to build the chute locally after any changes to check f
 Once you are happy with the changes, push your model to Huggingface Hub and then deploy it to Chutes and onto Bittensor with the following command:
 
 ```bash
-bb -vv push --model_path <i.e. ./my_model>
+bb -vv push --model-path <i.e. ./my_model>
 ```
 
-Note the hugginface repo revision and chute slug from the logs. If you missed it you can get the revision directly from your HF account and you can use this to get your chute-slug and ID:
+Note the HuggingFace repo revision and chute slug from the logs. If you missed it you can get the revision directly from your HF account and you can use this to get your chute-slug and ID:
 ```bash
 bb -v chute-slug --revision your-huggingface-repo-sha
 ```
@@ -282,6 +329,7 @@ MINER_MODEL_ID=gpt2           # Start with gpt2 for testing, upgrade for product
 MINER_AXON_PORT=8091          # Port for the miner API
 MINER_LOAD_IN_8BIT=0          # Enable 8-bit quantization (requires bitsandbytes)
 MINER_LOAD_IN_4BIT=0          # Enable 4-bit quantization (requires bitsandbytes)
+MINER_EXTERNAL_IP=your-public-ip  # Optional: override public IP for axon registration
 ```
 
 **Model recommendations:**
@@ -295,6 +343,7 @@ uv run python babelbit/miner/register_axon.py
 ```
 
 This registers your miner's IP and port with the Bittensor network so validators can find you.
+Note: this is only required for self-hosted miners. If you have a chute commitment, validators will use the chute and will not call the axon.
 
 3. **Start the miner server:**
 
@@ -314,6 +363,11 @@ uv run babelbit/miner/tests/test_miner_api.py
 ```
 
 This verifies both the health endpoint and prediction functionality.
+For local testing (no Bittensor headers), start the server in dev mode first:
+
+```bash
+MINER_DEV_MODE=1 uv run babelbit/miner/serve_miner.py
+```
 
 ### Performance Tips
 
@@ -346,7 +400,3 @@ This verifies both the health endpoint and prediction functionality.
 **Model download fails**
 - For gated models (Llama, etc.), set `HF_TOKEN` environment variable
 - Check your HuggingFace access permissions
-
-
-
-

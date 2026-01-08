@@ -1,3 +1,4 @@
+import gc
 from typing import List, Optional, Dict
 from logging import getLogger
 import os
@@ -164,20 +165,32 @@ async def _score_miners_for_challenge(
                     active_s3_manager.upload_file(str(events_path), s3_log_path)
                     logger.info(f"Uploaded raw dialogue log to S3: s3://{active_s3_manager.bucket_name}/{s3_log_path}")
                 if submission_client.is_ready:
-                    try:
-                        await submission_client.submit_validation_file(
-                            file_path=events_path,
-                            file_type="dialogue_run",
-                            kind="dialogue_logs",
-                            challenge_id=challenge_uid or "",
-                            main_challenge_uid=main_challenge_uid,
-                            miner_uid=getattr(m, "uid", None),
-                            miner_hotkey=getattr(m, "hotkey", None),
-                            dialogue_uid=dialogue_uid,
-                            s3_path=s3_log_path,
-                        )
-                    except Exception as e:
-                        logger.warning("Validation submission error for %s: %s", events_path.name, e)
+                    max_attempts = 4
+                    for attempt in range(1, max_attempts + 1):
+                        try:
+                            ok = await submission_client.submit_validation_file(
+                                file_path=events_path,
+                                file_type="dialogue_run",
+                                kind="dialogue_logs",
+                                challenge_id=challenge_uid or "",
+                                main_challenge_uid=main_challenge_uid,
+                                miner_uid=getattr(m, "uid", None),
+                                miner_hotkey=getattr(m, "hotkey", None),
+                                dialogue_uid=dialogue_uid,
+                                s3_path=s3_log_path,
+                            )
+                        except Exception as e:
+                            ok = False
+                            logger.warning("Validation submission error for %s: %s", events_path.name, e)
+                        if ok:
+                            break
+                        if attempt < max_attempts:
+                            backoff_s = min(2**attempt, 12)
+                            logger.info(
+                                f"Retrying validation submission for {events_path.name} "
+                                f"in {backoff_s}s (attempt {attempt + 1}/{max_attempts})",
+                            )
+                            await asyncio.sleep(backoff_s)
 
                 if score_jsonl is None:
                     logger.warning("score_jsonl unavailable; skipping scoring for dialogue %s", dialogue_uid)
@@ -429,7 +442,7 @@ async def runner(slug: str | None = None, utterance_engine_url: str | None = Non
         logger.info(f"Starting shared utterance session for {len(miner_list)} miners")
         
         # Get step block modulo from environment (default: 1 block)
-        step_block_modulo = int(os.getenv("BB_STEP_BLOCK_MODULO", "2"))
+        step_block_modulo = int(os.getenv("BB_STEP_BLOCK_MODULO", "0"))
         logger.debug(
             "[runner] session params: timeout=%.2fs step_block_modulo=%d", chutes_timeout, step_block_modulo
         )
@@ -586,6 +599,7 @@ async def runner_loop():
     last_block = -1
     last_successful_run = 0
     consecutive_failures = 0
+    run_count = 0
     
     # Initialize utterance engine authentication on startup
     utterance_engine_url = os.getenv("BB_UTTERANCE_ENGINE_URL", "https://api.babelbit.ai")
@@ -700,6 +714,15 @@ async def runner_loop():
                         last_block = block
                     last_successful_run = time.time()
                     consecutive_failures = 0  # Reset after successful validation cycle
+                    run_count += 1
+                    logger.info(f"[RunnerLoop] Completed runner cycle #{run_count}")
+                    
+                    if run_count >= 10:
+                        logger.info("[RunnerLoop] Reached 10 successful runs, resetting subtensor connection to free resources.")
+                        st = None
+                        await reset_subtensor()
+                        run_count = 0
+                        gc.collect()
 
             except asyncio.CancelledError:
                 break
