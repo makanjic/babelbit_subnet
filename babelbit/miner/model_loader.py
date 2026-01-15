@@ -21,6 +21,7 @@ def load_model_and_tokenizer(
     model_id: str,
     revision: Optional[str] = None,
     cache_dir: Optional[Path] = None,
+    adapter_model_id: Optional[str] = None,
     device: str = "cuda",
     load_in_8bit: bool = False,
     load_in_4bit: bool = False,
@@ -58,6 +59,7 @@ def load_model_and_tokenizer(
             cache_dir=cache_dir,
             token=use_auth_token,
             trust_remote_code=True,
+            use_fast=True,
         )
     except Exception as e:
         logger.error(f"Failed to load tokenizer: {e}")
@@ -100,9 +102,10 @@ def load_model_and_tokenizer(
             device_map=device_map,
             quantization_config=quantization_config,
             trust_remote_code=True,
-            dtype=torch.float16 if device == "cuda" else torch.float32,
+            dtype=torch.float16 if device == "cuda" else torch.float16,
             force_download=False,  # Don't force redownload
             resume_download=True,  # Resume incomplete downloads
+            low_cpu_mem_usage=True,
         )
     except Exception as e:
         error_msg = str(e)
@@ -143,6 +146,25 @@ def load_model_and_tokenizer(
                 "2. You have access to the model (set HF_TOKEN if private)\n"
                 "3. You have enough disk space and memory"
             ) from e
+
+    # Load adapter model if provided
+    if adapter_model_id is not None:
+        logger.info(f"Loading adapter model {adapter_model_id}...")
+        try:
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(
+                model,
+                adapter_model_id
+            )
+        except Exception as e:
+            logger.error(f"Failed to load adapter model: {e}")
+            raise RuntimeError(
+                f"Failed to load adapter model for {adapter_model_id}. "
+                "If this is a private model, ensure HF_TOKEN is set. "
+                "Check that the model exists and you have access."
+            ) from e
+        else:
+            logger.info(f"Adapter model {adapter_model_id} loaded successfully.")
     
     # Move to device if not using device_map
     if device_map is None and device == "cuda":
