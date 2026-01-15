@@ -12,7 +12,7 @@ from babelbit.utils.settings import get_settings
 logger = logging.getLogger(__name__)
 
 
-def register_axon(external_ip_override=None):
+def register_axon(external_ip_override=None, external_port_override=None):
     """Register the miner's axon on-chain."""
     logging.basicConfig(
         level=logging.INFO,
@@ -27,7 +27,7 @@ def register_axon(external_ip_override=None):
     wallet = bt.wallet(name=wallet_name, hotkey=hotkey_name)
     
     # Get axon configuration
-    axon_port = settings.MINER_AXON_PORT
+    axon_port = external_port_override or settings.MINER_AXON_PORT
     external_ip = external_ip_override or settings.MINER_EXTERNAL_IP
     
     logger.info(f"Wallet: {wallet_name}/{hotkey_name}")
@@ -116,6 +116,12 @@ Examples:
         help="External IP address for the axon (overrides MINER_EXTERNAL_IP setting)",
         default=None
     )
+    parser.add_argument(
+        "--external-port",
+        type=int,
+        help="External port for the axon (overrides MINER_AXON_PORT setting)",
+        default=None
+    )
     
     # Parse known args to avoid conflicts with bittensor's parser
     args, unknown = parser.parse_known_args()
@@ -125,4 +131,4 @@ Examples:
         parser.print_help()
         exit(0)
     
-    register_axon(external_ip_override=args.external_ip)
+    register_axon(external_ip_override=args.external_ip, external_port_override=args.external_port)
