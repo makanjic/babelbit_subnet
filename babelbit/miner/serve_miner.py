@@ -50,6 +50,17 @@ _ABBREVIATIONS = {
     "u.s.", "u.k.", "no.", "st.", "mt.",
 }
 
+PROMPT_TEMPLATE = """
+<|system|>
+You predict the full utterance from a partial prefix. Output only the completion.
+<|user|>
+Context:
+{context}
+Prefix:
+{prefix}
+<|assistant|>
+"""
+
 
 def _truncate_at_eof_token(text: str, eof_token: str) -> str:
     """Truncate `text` at the first occurrence of `eof_token` (literal substring)."""
@@ -108,6 +119,12 @@ def _join_prefix_completion(prefix: str, completion: str) -> str:
     if not completion:
         return prefix
 
+    if completion.startswith(prefix):
+        return completion
+
+    if completion.strip().startswith(prefix):
+        return completion.strip()
+
     if completion[:1].isspace():
         return (prefix + completion).strip()
 
@@ -165,6 +182,7 @@ class BabelbitMiner:
         model_id: str,
         revision: Optional[str] = None,
         cache_dir: Optional[Path] = None,
+        adapter_model_id: Optional[str] = None,
         device: str = "cuda",
         load_in_8bit: bool = False,
         load_in_4bit: bool = False,
@@ -183,6 +201,7 @@ class BabelbitMiner:
         self.model_id = model_id
         self.revision = revision
         self.cache_dir = cache_dir
+        self.adapter_model_id = adapter_model_id
         self.load_in_8bit = load_in_8bit
         self.load_in_4bit = load_in_4bit
         
@@ -197,6 +216,7 @@ class BabelbitMiner:
         self._model_moved = False
         
         logger.info(f"Initialized BabelbitMiner with model: {model_id}")
+        logger.info(f"Adapter model ID: {adapter_model_id}")
         logger.info(f"Target device: {self.device}, dtype: {self.dtype}")
     
     def _pick_device(self) -> torch.device:
@@ -222,63 +242,10 @@ class BabelbitMiner:
     def _prepare_inputs(self, prompt: str) -> torch.Tensor:
         """Tokenize prompt with caching of static system+instruction part."""
         try:
-            # Simple cache key for tiny prompts
-            if len(prompt) < 256:
-                inputs = self._tokenizer.encode(prompt, return_tensors="pt")
-                if inputs.numel() == 0:
-                    raise ValueError("Empty tokenization result")
-                return inputs.to(self.device)
-
-            # -----------------------------------------------------------------
-            # Prompt tokenization caching (context + separator + prefix)
-            # -----------------------------------------------------------------
-            # The miner prompt is train-faithful:
-            #   - prompt = prefix
-            #   - prompt = context + SEP + prefix
-            #
-            # Validators commonly query multiple steps for the same utterance:
-            # the context remains constant while the prefix grows. To reduce
-            # repeated tokenization cost, cache tokenization of:
-            #   static_part = context + SEP
-            # and only encode the dynamic prefix tail.
-            #
-            # IMPORTANT:
-            # Some tokenizers can tokenize boundaries differently if you split at
-            # a non-whitespace boundary. We therefore only enable the split-cache
-            # when SEP ends with whitespace, and we split on the *last* occurrence
-            # of SEP inside the prompt.
-            sep = os.getenv("MINER_CONTEXT_SEPARATOR", " EOF ")
-            idx = prompt.rfind(sep) if sep else -1
-            if idx != -1 and sep and len(sep) > 0 and sep[-1].isspace():
-                split_at = idx + len(sep)  # include SEP inside cached portion
-                static_part = prompt[:split_at]
-                dynamic_part = prompt[split_at:]
-
-                cache_key = static_part
-
-                if cache_key in _PROMPT_CACHE:
-                    static_ids = _PROMPT_CACHE[cache_key]
-                else:
-                    static_ids = self._tokenizer.encode(static_part, return_tensors="pt")
-                    if static_ids.numel() == 0:
-                        raise ValueError("Empty static tokenization result")
-                    _PROMPT_CACHE[cache_key] = static_ids
-                
-                dyn_ids = self._tokenizer.encode(dynamic_part, return_tensors="pt")
-                if dyn_ids.numel() == 0:
-                    raise ValueError("Empty dynamic tokenization result")
-
-                # Concatenate cached static context+SEP ids with dynamic prefix ids.
-                full = torch.cat([static_ids, dyn_ids], dim=1)
-
-                if full.numel() == 0:
-                    raise ValueError("Empty concatenated tensor")
-                return full.to(self.device)
-            
             # Fallback: no split
             inputs = self._tokenizer.encode(prompt, return_tensors="pt")
             if inputs.numel() == 0:
-                raise ValueError("Empty fallback tokenization result")
+                raise ValueError("Empty tokenization result")
             return inputs.to(self.device)
             
         except Exception as e:
@@ -295,11 +262,14 @@ class BabelbitMiner:
         async with self._model_lock:
             if self._model is None:
                 logger.info(f"Loading model {self.model_id}...")
+                logger.info(f"Adapter model ID: {self.adapter_model_id}")
+
                 self._model, self._tokenizer = await asyncio.to_thread(
                     load_model_and_tokenizer,
                     model_id=self.model_id,
                     revision=self.revision,
                     cache_dir=self.cache_dir,
+                    adapter_model_id=self.adapter_model_id,
                     device=self.device,
                     load_in_8bit=self.load_in_8bit,
                     load_in_4bit=self.load_in_4bit,
@@ -343,12 +313,7 @@ class BabelbitMiner:
             # The separator must match your training wrapper (default: " EOF ").
             # Keep it configurable via env var for operational flexibility.
             sep = os.getenv("MINER_CONTEXT_SEPARATOR", " EOF ")
-
-            if request.context:
-                # If prefix is empty, mirror training behavior: ctx + sep
-                prompt = f"{request.context}{sep}{request.prefix}" if request.prefix else f"{request.context}{sep}"
-            else:
-                prompt = f"{request.prefix}"
+            prompt = PROMPT_TEMPLATE.format(context=request.context, prefix=request.prefix)
 
             # Transformers edge case: empty prompt can yield empty input_ids and
             # break generation. Match harness behavior by forcing a safe token.
@@ -426,7 +391,7 @@ class BabelbitMiner:
                     
                     def _generate_on_device():
                         return self._model.generate(inputs, **gen_kwargs)
-                    
+
                     outputs = await asyncio.to_thread(_generate_on_device)
 
                 except RuntimeError as e:
@@ -512,6 +477,7 @@ async def startup():
     # Get model configuration
     model_id = settings.MINER_MODEL_ID
     revision = getattr(settings, 'MINER_MODEL_REVISION', None)
+    adapter_model_id = getattr(settings, 'ADAPTER_MODEL_ID', None)
     cache_dir = settings.BABELBIT_CACHE_DIR / "models"
     cache_dir.mkdir(parents=True, exist_ok=True)
     
@@ -531,6 +497,7 @@ async def startup():
     miner_instance = BabelbitMiner(
         model_id=model_id,
         revision=revision,
+        adapter_model_id=adapter_model_id,
         cache_dir=cache_dir,
         device=device,
         load_in_8bit=load_in_8bit,
