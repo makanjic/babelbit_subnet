@@ -94,6 +94,8 @@ class Settings(BaseModel):
     MINER_LOAD_IN_4BIT: bool
     MINER_EXTERNAL_IP: Optional[str]
     
+    ADAPTER_MODEL_ID: Optional[str] = None
+
     # Development mode settings
     BB_DEV_MODE: bool = False
     BB_LOCAL_MINER_IP: Optional[str] = None
@@ -196,4 +198,5 @@ def get_settings() -> Settings:
         MINER_LOAD_IN_4BIT=getenv("MINER_LOAD_IN_4BIT", "0").lower() in {"1", "true", "yes"},
         MINER_EXTERNAL_IP=getenv("MINER_EXTERNAL_IP"),
 
+        ADAPTER_MODEL_ID=getenv("ADAPTER_MODEL_ID", None),
     )
