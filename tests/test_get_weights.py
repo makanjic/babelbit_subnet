@@ -136,8 +136,8 @@ async def test_get_weights_selects_winner_and_resets_counter(monkeypatch):
         default_uid=248,
     )
 
-    assert uids == [1]  # hk2 is the winner at index 1
-    assert weights == [1.0]
+    assert uids == [1, 0]  # hk2 is the winner at index 1, hk1 trails
+    assert weights == pytest.approx([0.95, 0.05])
     assert no_score_rounds == 0
 
 
@@ -176,12 +176,40 @@ async def test_get_weights_updates_metrics_and_prefers_first_occurrence(monkeypa
         default_uid=248,
     )
 
-    assert uids == [1]  # hk2 wins
-    assert weights == [1.0]
+    assert uids == [1, 0]  # hk2 wins, hk1 trails
+    assert weights == pytest.approx([0.95, 0.05])
     assert no_score_rounds == 0
     assert ("0", 0.4) in scores_gauge.calls
     assert ("1", 0.9) in scores_gauge.calls
     assert winner_gauge.value == 1
+
+
+@pytest.mark.asyncio
+async def test_get_weights_accepts_zero_scores(monkeypatch):
+    """Zero scores should still count as valid results (not treated as missing)."""
+    fake_settings = SimpleNamespace(BB_SUBMIT_API_URL="http://api")
+    from babelbit.cli import validate as validate_mod
+
+    monkeypatch.setattr(validate_mod, "get_settings", lambda: fake_settings)
+    monkeypatch.setattr(
+        validate_mod,
+        "fetch_scores_from_api",
+        AsyncMock(return_value=[{"miner_hotkey": "hk-zero", "challenge_mean_score": 0.0}]),
+    )
+
+    uids, weights, no_score_rounds = await validate_mod.get_weights(
+        metagraph=SimpleNamespace(hotkeys=["hk-zero"]),
+        validator_kp=SimpleNamespace(ss58_address="validator-hk"),
+        challenge_uid="chal-zero",
+        last_weights=None,
+        no_score_rounds=2,
+        max_no_score_rounds=5,
+        default_uid=248,
+    )
+
+    assert uids == [0]
+    assert weights == [1.0]
+    assert no_score_rounds == 0
 
 
 @pytest.mark.asyncio
