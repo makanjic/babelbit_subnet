@@ -116,6 +116,24 @@ def _classify_model_type(model_name: str, explicit: Optional[str]) -> str:
     )
     return "base"
 
+def _normalize_base_url(base_url: str) -> str:
+    """
+    Normalize OPENAI_BASE_URL for endpoint construction.
+
+    Accepts either:
+      - https://api.openai.com/v1
+      - https://api.openai.com
+      - https://<provider>/v1
+
+    Returns a base URL that ends with '/v1'.
+    """
+    u = (base_url or "").strip().rstrip("/")
+    if not u:
+        u = "https://api.openai.com/v1"
+    if u.endswith("/v1"):
+        return u
+    return u + "/v1"
+
 
 class BabelbitMiner:
     """
@@ -125,11 +143,11 @@ class BabelbitMiner:
     Model types and endpoints:
 
       - "instruct":
-          * Uses /v1/chat/completions with role-based messages.
+          * Uses /chat/completions with role-based messages.
           * Prompt structure matches original HuggingFace-based miner:
             system + user (Context + prefix).
       - "base":
-          * Uses /v1/completions with a single `prompt`:
+          * Uses /completions with a single `prompt`:
             context sentences joined by '\\n', followed by prefix.
 
     In both cases, the dialogue context string is first split into
@@ -155,13 +173,13 @@ class BabelbitMiner:
             api_key:
                 API key / bearer token to use in Authorization header.
             model:
-                Model name for /v1/chat/completions or /v1/completions.
+                Model name for /chat/completions or /completions.
             model_type:
                 Either "instruct" or "base".
             request_timeout:
                 Per-request timeout for the API call (seconds).
         """
-        self.api_base = api_base.rstrip("/")
+        self.api_base = _normalize_base_url(api_base)
         self.api_key = api_key
         self.model = model
         self.model_type = model_type  # already normalized by classifier
@@ -281,7 +299,7 @@ class BabelbitMiner:
 
     async def _call_openai_chat(self, messages) -> str:
         """
-        Call the OpenAI-compatible /v1/chat/completions endpoint and return
+        Call the OpenAI-compatible /chat/completions endpoint and return
         the raw model content (assistant message text).
 
         Args:
@@ -296,7 +314,7 @@ class BabelbitMiner:
         top_p = self._get_env_float("CHUTE_TOP_P", 0.95)
         stop = self._get_stop_sequences()
 
-        url = f"{self.api_base}/v1/chat/completions"
+        url = f"{self.api_base}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -330,7 +348,7 @@ class BabelbitMiner:
 
                 try:
                     choices = data.get("choices") or []
-                    if not choices:
+                    if not choices:.
                         logger.warning("OpenAI-compatible CHAT response has no choices")
                         return ""
                     msg = choices[0].get("message") or {}
@@ -346,7 +364,7 @@ class BabelbitMiner:
 
     async def _call_openai_completion(self, prompt: str) -> str:
         """
-        Call the OpenAI-compatible /v1/completions endpoint (for base models)
+        Call the OpenAI-compatible /completions endpoint (for base models)
         and return the raw text (continuation).
 
         Args:
@@ -361,7 +379,7 @@ class BabelbitMiner:
         top_p = self._get_env_float("CHUTE_TOP_P", 0.95)
         stop = self._get_stop_sequences()
 
-        url = f"{self.api_base}/v1/completions"
+        url = f"{self.api_base}/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -434,7 +452,7 @@ class BabelbitMiner:
             logger.info("Using %d context sentence(s)", len(context_sentences))
 
             if self.model_type == "base":
-                # BASE MODEL FLOW -> /v1/completions (prompt continuation)
+                # BASE MODEL FLOW -> /completions (prompt continuation)
                 if context_sentences:
                     prompt_text = "\n".join(context_sentences + [request.prefix])
                 else:
@@ -442,7 +460,7 @@ class BabelbitMiner:
 
                 completion = await self._call_openai_completion(prompt=prompt_text)
             else:
-                # INSTRUCT MODEL FLOW -> /v1/chat/completions (system + user)
+                # INSTRUCT MODEL FLOW -> /chat/completions (system + user)
                 system_msg = (
                     "You are a helpful assistant that completes the current utterance naturally "
                     "and succinctly. "
