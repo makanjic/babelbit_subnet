@@ -348,7 +348,7 @@ class BabelbitMiner:
 
                 try:
                     choices = data.get("choices") or []
-                    if not choices:.
+                    if not choices:
                         logger.warning("OpenAI-compatible CHAT response has no choices")
                         return ""
                     msg = choices[0].get("message") or {}
