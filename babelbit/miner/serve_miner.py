@@ -2,6 +2,9 @@
 Simple FastAPI-based miner server for Babelbit subnet.
 Serves predictions via HTTP endpoint that validators can call directly.
 
+This version uses an OpenAI-compatible HTTP API (e.g. official OpenAI,
+vLLM / llama.cpp OpenAI server, etc.) instead of loading a local HF model.
+
 Note: Run register_axon.py first to register your miner on-chain,
 then run this script to serve predictions.
 """
@@ -9,7 +12,7 @@ import asyncio
 import logging
 import os
 from traceback import format_exc
-from typing import Optional, List, Tuple
+from typing import Optional, List
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Request, status
@@ -21,11 +24,17 @@ from babelbit.utils.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
+# Cached miner hotkey (SS58) for Bittensor request verification.
 _MINER_HOTKEY_SS58: Optional[str] = None
 
 
 def _get_miner_hotkey_ss58() -> Optional[str]:
-    """Load and cache this miner's hotkey SS58 address."""
+    """
+    Load and cache this miner's hotkey SS58 address.
+
+    This is used to ensure that incoming Bittensor protocol requests are
+    actually addressed to this miner (i.e., bt_header_axon_hotkey matches).
+    """
     global _MINER_HOTKEY_SS58
     if _MINER_HOTKEY_SS58:
         return _MINER_HOTKEY_SS58
@@ -42,8 +51,59 @@ def _get_miner_hotkey_ss58() -> Optional[str]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Client IP helpers
+# ---------------------------------------------------------------------------
+
+def get_client_ip(request: Request) -> str:
+    """
+    Resolve the best-guess client IP address from an incoming FastAPI Request.
+
+    This is *proxy-aware*, i.e. it prefers common forwarding headers when
+    the app is running behind a reverse proxy or load balancer.
+
+    Priority:
+      1. X-Forwarded-For (first IP in the comma-separated list)
+      2. X-Real-IP
+      3. request.client.host (direct connection from ASGI server)
+
+    Returns:
+        A string containing the resolved IP address, or "unknown" if it
+        cannot be determined.
+    """
+    # 1) Standard header carrying the entire proxy chain:
+    #    "client, proxy1, proxy2, ..."
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        # Take the first entry (original client); strip whitespace to be safe.
+        first = xff.split(",")[0].strip()
+        if first:
+            return first
+
+    # 2) Common alternative header set by some proxies (e.g. NGINX).
+    x_real_ip = request.headers.get("x-real-ip")
+    if x_real_ip:
+        return x_real_ip.strip()
+
+    # 3) Fallback: direct peer IP as seen by the ASGI server (Uvicorn).
+    if request.client:
+        return request.client.host
+
+    # If everything else fails, return a sentinel value instead of raising.
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
+
 class BBUtteranceEvaluation(BaseModel):
-    """Evaluation result for utterance prediction (echoed from validator if present)."""
+    """
+    Evaluation result for utterance prediction (echoed from validator if present).
+
+    These values are not used by the miner itself but are kept for compatibility
+    with the BBPredictedUtterance schema and may be populated by validators.
+    """
     lexical_similarity: float = 0.0
     semantic_similarity: float = 0.0
     earliness: float = 0.0
@@ -57,8 +117,8 @@ class PredictRequest(BaseModel):
     The miner only *uses* index, step, prefix, context for prediction.
     Other fields are kept for compatibility (and may be filled by validators).
     """
-    index: str  # UUID session identifier
-    step: int
+    index: str  # UUID session identifier (originates from utterance engine)
+    step: int   # Step index within the current utterance
     prefix: str
     context: str = ""
     done: bool = False
@@ -68,17 +128,32 @@ class PredictRequest(BaseModel):
 
 
 class PredictResponse(BaseModel):
-    """Simple response schema expected by validator."""
+    """
+    Simple response schema expected by validator.
+
+    The validator only needs the prediction string; all scoring and bookkeeping
+    is handled on the validator side.
+    """
     prediction: str
 
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible miner implementation
+# ---------------------------------------------------------------------------
 
 def _classify_model_type(model_name: str, explicit: Optional[str]) -> str:
     """
     Decide whether the model should be treated as "base" or "instruct".
 
     Priority:
-      1. If explicit is "base" or "instruct", trust it.
+      1. If explicit is "base" or "instruct", trust it (OPENAI_MODEL_TYPE).
       2. Otherwise, infer from model name heuristics.
+
+    Heuristics:
+      - If the model name contains "gpt-4", "gpt-3.5", "instruct", "chat",
+        or "turbo", we treat it as an instruction/chat model and use the
+        /chat/completions endpoint.
+      - Otherwise, we fall back to "base" and use the /completions endpoint.
     """
     if explicit:
         value = explicit.lower()
@@ -116,16 +191,19 @@ def _classify_model_type(model_name: str, explicit: Optional[str]) -> str:
     )
     return "base"
 
+
 def _normalize_base_url(base_url: str) -> str:
     """
-    Normalize OPENAI_BASE_URL for endpoint construction.
+    Normalize OPENAI_BASE_URL / OPENAI_API_BASE for endpoint construction.
 
     Accepts either:
       - https://api.openai.com/v1
       - https://api.openai.com
       - https://<provider>/v1
 
-    Returns a base URL that ends with '/v1'.
+    Returns:
+        A base URL that *always* ends with '/v1', so we can safely append
+        '/chat/completions' or '/completions'.
     """
     u = (base_url or "").strip().rstrip("/")
     if not u:
@@ -175,7 +253,7 @@ class BabelbitMiner:
             model:
                 Model name for /chat/completions or /completions.
             model_type:
-                Either "instruct" or "base".
+                Either "base" or "instruct".
             request_timeout:
                 Per-request timeout for the API call (seconds).
         """
@@ -185,7 +263,8 @@ class BabelbitMiner:
         self.model_type = model_type  # already normalized by classifier
         self.request_timeout = float(request_timeout)
 
-        # A shared aiohttp client session for all requests
+        # A shared aiohttp client session for all requests.
+        # Using a single session gives better connection reuse and lower latency.
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
 
@@ -199,7 +278,8 @@ class BabelbitMiner:
         """
         Lazily create a shared aiohttp.ClientSession.
 
-        Using one session avoids connection overhead per request.
+        By keeping one session per process, we avoid the overhead of
+        creating TCP connections for every /predict call.
         """
         if self._session and not self._session.closed:
             return self._session
@@ -218,7 +298,7 @@ class BabelbitMiner:
         Placeholder for compatibility with the old HF-based miner.
 
         For an HTTP-based OpenAI-compatible API we don't need to preload anything,
-        but we validate configuration here.
+        but we validate configuration here so misconfigurations are caught early.
         """
         if not self.api_key:
             raise RuntimeError(
@@ -241,7 +321,7 @@ class BabelbitMiner:
 
     @staticmethod
     def _get_env_int(name: str, default: int) -> int:
-        """Get integer from environment variable."""
+        """Get integer from environment variable with a safe fallback."""
         try:
             return int(os.getenv(name, str(default)))
         except Exception:
@@ -249,7 +329,7 @@ class BabelbitMiner:
 
     @staticmethod
     def _get_env_float(name: str, default: float) -> float:
-        """Get float from environment variable."""
+        """Get float from environment variable with a safe fallback."""
         try:
             return float(os.getenv(name, str(default)))
         except Exception:
@@ -261,9 +341,12 @@ class BabelbitMiner:
         Split the context string into sentences using delimiter " EOF ",
         strip whitespace, and drop empty chunks.
 
+        Example:
+            context = "S1 EOF S2 EOF S3"
+            -> ["S1", "S2", "S3"]
+
         Returns:
-            A list of context sentences, e.g.
-            ["This is sentence 1.", "This is sentence 2.", ...]
+            A list of context sentences.
         """
         if not context:
             return []
@@ -284,13 +367,17 @@ class BabelbitMiner:
 
         Example:
             OPENAI_STOP_SEQS=" EOF,\\n\\n"
+
+        Notes:
+            The values are unescaped using 'unicode_escape' so you can pass
+            sequences like "\\n\\n" via environment variables.
         """
         raw = os.getenv("OPENAI_STOP_SEQS", "").strip()
         if not raw:
             # Default: stop when the model tries to cross utterance boundary.
             return [" EOF"]
 
-        items = []
+        items: List[str] = []
         for part in raw.split(","):
             s = part.encode("utf-8").decode("unicode_escape").strip()
             if s:
@@ -431,21 +518,26 @@ class BabelbitMiner:
         Generate prediction for the given prefix and context, using an
         OpenAI-compatible API (chat or completions) based on model_type.
 
-        Args:
-            request: Prediction request with prefix and context.
-
-        Returns:
-            PredictResponse with generated full utterance (prefix + completion).
+        Pipeline:
+          1. Split `request.context` into sentences using " EOF ".
+          2. For "base" models:
+                prompt = "\\n".join(context_sentences + [prefix])
+             and call /completions.
+          3. For "instruct" models:
+                messages = [system, user(context+prefix)]
+             and call /chat/completions.
+          4. Concatenate original prefix + generated completion as the final
+             "full utterance" prediction.
         """
         try:
-            # Ensure configuration is valid (no-op after first time)
+            # Ensure configuration is valid (no-op after first successful call).
             await self.load()
 
             if not request.prefix:
                 logger.warning("No prefix provided, returning empty prediction")
                 return PredictResponse(prediction="")
 
-            # Split context into a list of sentences using " EOF "
+            # Split context into a list of sentences using " EOF ".
             context_sentences = self._split_context(request.context)
 
             logger.info("Generating prediction for prefix: %r", request.prefix)
@@ -453,6 +545,8 @@ class BabelbitMiner:
 
             if self.model_type == "base":
                 # BASE MODEL FLOW -> /completions (prompt continuation)
+                # Prompt is just the concatenation of all context sentences
+                # and the current prefix, separated by newlines.
                 if context_sentences:
                     prompt_text = "\n".join(context_sentences + [request.prefix])
                 else:
@@ -488,14 +582,14 @@ class BabelbitMiner:
 
                 completion = await self._call_openai_chat(messages=messages)
 
-            # If nothing useful, fallback
+            # If nothing useful, fallback.
             if not completion or not completion.strip():
                 fallback = os.getenv("CHUTE_FALLBACK_COMPLETION", "...")
                 full_prediction = f"{request.prefix} {fallback}".strip()
                 logger.info("Empty completion, using fallback -> %r", full_prediction)
                 return PredictResponse(prediction=full_prediction)
 
-            # Clean and join prefix + completion
+            # Clean and join prefix + completion.
             prediction = completion.strip()
 
             # Heuristic: if the model repeats the prefix at the beginning, strip it.
@@ -509,16 +603,24 @@ class BabelbitMiner:
         except Exception as e:
             logger.error(f"Error in predict: {e}")
             logger.error(format_exc())
-            # Return empty prediction on error (validator will handle)
+            # Return empty prediction on error (validator will handle).
             return PredictResponse(prediction="")
 
 
-# Global miner instance
+# Global miner instance (initialized on startup)
 miner_instance: Optional[BabelbitMiner] = None
 
 
 async def startup():
-    """FastAPI startup event handler."""
+    """
+    FastAPI startup event handler.
+
+    Responsibilities:
+      - Read OpenAI-compatible settings from environment.
+      - Decide model_type ("base" vs "instruct") via heuristics or override.
+      - Instantiate BabelbitMiner.
+      - Run miner_instance.load() once to validate configuration early.
+    """
     global miner_instance
 
     settings = get_settings()
@@ -570,13 +672,20 @@ async def startup():
         raise
 
 
-# Create FastAPI app
+# Create FastAPI app and register startup hook.
 app = FastAPI(title="Babelbit Miner", on_startup=[startup])
 
 
 @app.get("/healthz")
 async def health():
-    """Health check endpoint."""
+    """
+    Health check endpoint (Kubernetes-style).
+
+    Returns basic information about:
+      - whether the miner instance is initialized
+      - which model it is configured to call
+      - which backend flavor is in use
+    """
     return {
         "status": "healthy",
         "model": miner_instance.model if miner_instance else "not_initialized",
@@ -588,7 +697,12 @@ async def health():
 
 @app.get("/health")
 async def health_alt():
-    """Alternative health check endpoint."""
+    """
+    Alternative health check endpoint.
+
+    Same payload as /healthz, kept for compatibility with earlier setups
+    that probe "/health" explicitly.
+    """
     return {
         "status": "healthy",
         "model": miner_instance.model if miner_instance else "not_initialized",
@@ -606,15 +720,41 @@ async def predict_endpoint(
     """
     Prediction endpoint with Bittensor protocol verification.
 
-    Validates incoming requests from validators using cryptographic signatures
-    and nonce-based replay attack prevention.
+    Responsibilities:
+      - Optionally log the client IP (proxy-safe) and request metadata.
+      - Verify Bittensor dendrite-axon headers (unless dev mode is enabled).
+      - Enforce that the request is addressed to *this* miner's hotkey.
+      - Delegate to miner_instance.predict(request) to get the utterance
+        completion from the OpenAI-compatible backend.
 
-    Set MINER_DEV_MODE=1 to bypass verification for local testing.
+    Set MINER_DEV_MODE=1 (or true) to bypass verification for local testing.
     """
     if miner_instance is None:
         raise HTTPException(status_code=503, detail="Miner not initialized")
 
-    # Check if dev mode is enabled (bypass verification)
+    # ----------------------------------------------------------------------
+    # Proxy-safe client IP logging
+    # ----------------------------------------------------------------------
+    # We resolve the client IP *before* any Bittensor logic so that this
+    # logging works both in dev mode and production mode.
+    client_ip = get_client_ip(http_request)
+    try:
+        # If Bittensor headers are present, this is typically the validator's
+        # external hotkey; we log at most a shortened prefix for hygiene.
+        dendrite_hotkey_hdr = http_request.headers.get("bt_header_dendrite_hotkey")
+        logger.info(
+            "Incoming /predict from client_ip=%s dendrite_hotkey=%s index=%s step=%s",
+            client_ip,
+            (dendrite_hotkey_hdr[:16] + "...") if dendrite_hotkey_hdr else None,
+            request.index,
+            request.step,
+        )
+    except Exception:
+        # Never let logging failures break the endpoint.
+        logger.debug("Failed to log client IP for /predict", exc_info=True)
+    # ----------------------------------------------------------------------
+
+    # Check if dev mode is enabled (bypass verification).
     settings = get_settings()
     dev_mode = (
         getattr(settings, "MINER_DEV_MODE", False)
@@ -628,7 +768,7 @@ async def predict_endpoint(
     # Extract Bittensor headers
     headers = http_request.headers
 
-    # Get required Bittensor protocol headers
+    # Required Bittensor protocol headers
     dendrite_hotkey = headers.get("bt_header_dendrite_hotkey")
     dendrite_nonce = headers.get("bt_header_dendrite_nonce")
     dendrite_signature = headers.get("bt_header_dendrite_signature")
@@ -650,7 +790,7 @@ async def predict_endpoint(
     )
 
     if is_bittensor_request:
-        # Ensure the request is intended for this miner's hotkey
+        # Ensure the request is intended for this miner's hotkey.
         if miner_hotkey and axon_hotkey and axon_hotkey != miner_hotkey:
             logger.warning(
                 "Rejecting request: target hotkey mismatch (expected %s, got %s)",
@@ -662,7 +802,7 @@ async def predict_endpoint(
                 detail="Request not addressed to this miner hotkey",
             )
 
-        # Verify the request using Bittensor protocol
+        # Verify the request using Bittensor protocol.
         try:
             timeout = float(timeout_str)
         except ValueError:
@@ -694,25 +834,31 @@ async def predict_endpoint(
             dendrite_hotkey[:8] if dendrite_hotkey else "unknown",
         )
     else:
-        # Non-Bittensor request - check dev mode
+        # Non-Bittensor request - only allowed in dev mode.
         if not dev_mode:
-            # In production mode, reject requests without Bittensor headers
             logger.warning("Rejecting request without Bittensor headers (production mode)")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Bittensor protocol headers required",
             )
 
-        # Allow non-Bittensor requests only in dev mode
         logger.info("Processing request without Bittensor verification (dev mode)")
 
-    # Process the prediction request
+    # Process the prediction request via the OpenAI-compatible backend.
     return await miner_instance.predict(request)
 
 
 async def main():
-    """Main entry point for the miner server."""
-    # Setup logging
+    """
+    Main entry point for the miner server.
+
+    Responsibilities:
+      - Configure root logging.
+      - Read axon port from settings.
+      - Log mode (dev vs production).
+      - Start Uvicorn with this FastAPI app.
+    """
+    # Setup logging for the entire process.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
